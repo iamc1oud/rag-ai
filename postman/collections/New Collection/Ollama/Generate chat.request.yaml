@@ -1,0 +1,32 @@
+$kind: http-request
+url: http://localhost:11434/api/chat
+method: POST
+headers:
+  Content-Type: application/json
+body:
+  type: json
+  content: |-
+    {
+      "model": "gemma4:31b-cloud",
+      "messages": [{"role": "user", "content": "Hi cutie"}],
+      "stream": false,
+    //   "format": {
+    //     "type": "object",
+    //     "properties": {
+    //       "age": {
+    //         "type": "integer"
+    //       },
+    //       "available": {
+    //         "type": "boolean"
+    //       }
+    //     },
+    //     "required": [
+    //       "age",
+    //       "available"
+    //     ]
+    //   },
+      "options": {
+        "temperature": 0
+      }
+    }
+order: 1081490532012097
