@@ -566,7 +566,19 @@ away.
 (issue #5's `search_kwargs={"k": 5}`), so this is confirmation the existing default is
 load-bearing, not a new code change.
 
-**Re-run, improvement shown:**
+**Re-run, improvement shown.** `compare_k()` in `eval.py` runs both k values and diffs
+them in code — not just numbers copied into this doc by hand:
+
+```bash
+$ python eval.py compare 3 5
+                                       k=3         k=5
+Hit Rate                             0.875       1.000
+MRR                                  0.802       0.830
+
+2 question(s) whose rank changed:
+  None -> 5            What is the recommended basic editor for writing your first Python programs?
+  None -> 4            How do you print 'Hello World' in Python?
+```
 
 | | Hit Rate | MRR |
 | --- | --- | --- |

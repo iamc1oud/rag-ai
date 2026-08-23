@@ -62,7 +62,7 @@ from ragas.metrics.collections import (  # noqa: E402
 # than an equally correct answer worded differently). Using a different,
 # smaller local model as judge avoids that and avoids paying for judge calls
 # on the cloud model. See README for the fuller bias discussion.
-JUDGE_MODEL = "gemma4:31b-cloud"
+JUDGE_MODEL = "ornith:9b"
 
 
 @dataclass
@@ -203,6 +203,13 @@ async def _generation_metrics_async(store, test_set: list[TestCase], k: int) -> 
             }
         )
 
+        print(f"question: {case.question}")
+        print(f"answer: {answer}")
+        print(f"faithfulness: {f.value}")
+        print(f"answer_relevancy: {r.value}")
+        print(f"context_precision: {p.value}")
+        print('--------')
+
     n = len(rows)
     return {
         "avg_faithfulness": sum(r["faithfulness"] for r in rows) / n,
@@ -214,6 +221,41 @@ async def _generation_metrics_async(store, test_set: list[TestCase], k: int) -> 
 
 def generation_metrics(store, test_set: list[TestCase] = TEST_SET, k: int = 5) -> dict:
     return asyncio.run(_generation_metrics_async(store, test_set, k))
+
+
+def compare_k(store, test_set: list[TestCase], ks: tuple[int, ...] = (3, 5)) -> dict:
+    """Run retrieval_metrics at each k in `ks` and return a before/after table.
+
+    This is the tuning iteration itself, in code: two eval runs plus a diff,
+    not just numbers copied into README by hand. `python eval.py compare 3 5`
+    reruns this against the live store and prints the same table.
+    """
+    runs = [retrieval_metrics(store, test_set, k=k) for k in ks]
+
+    # per-question rank at each k, so a "before" miss that "after" fixes is
+    # visible, not just the aggregate hit_rate/mrr moving
+    rows = [
+        {"question": case.question, "ranks": [run["ranks"][i][1] for run in runs]}
+        for i, case in enumerate(test_set)
+    ]
+
+    return {"ks": ks, "runs": runs, "rows": rows}
+
+
+def print_comparison(comparison: dict) -> None:
+    ks = comparison["ks"]
+    runs = comparison["runs"]
+    header = "".join(f"{'k=' + str(k):>12}" for k in ks)
+    print(f"{'':30}{header}")
+    print(f"{'Hit Rate':30}" + "".join(f"{r['hit_rate']:>12.3f}" for r in runs))
+    print(f"{'MRR':30}" + "".join(f"{r['mrr']:>12.3f}" for r in runs))
+
+    changed = [row for row in comparison["rows"] if len(set(row["ranks"])) > 1]
+    if changed:
+        print(f"\n{len(changed)} question(s) whose rank changed:")
+        for row in changed:
+            rank_str = " -> ".join(str(r) for r in row["ranks"])
+            print(f"  {rank_str:20} {row['question']}")
 
 
 def print_report(retrieval: dict, generation: dict | None = None) -> None:
@@ -257,6 +299,13 @@ def _self_check():
     m_k1 = retrieval_metrics(FakeStore(), cases, k=1)
     assert m_k1["hit_rate"] == 1 / 3, m_k1  # only the rank-1 hit survives a smaller k
 
+    comparison = compare_k(FakeStore(), cases, ks=(1, 3))
+    assert comparison["runs"][0]["hit_rate"] == 1 / 3  # k=1
+    assert comparison["runs"][1]["hit_rate"] == 2 / 3  # k=3
+    changed = [row for row in comparison["rows"] if len(set(row["ranks"])) > 1]
+    assert [row["question"] for row in changed] == ["hit at rank 3"]
+    assert changed[0]["ranks"] == [None, 3]  # miss at k=1, rank 3 at k=3
+
     print("ok (unit checks only; run eval.py for a live report)")
 
 
@@ -274,5 +323,11 @@ if __name__ == "__main__":
         run_generation = "--no-ragas" not in sys.argv
         generation = generation_metrics(store, TEST_SET, k=k) if run_generation else None
         print_report(retrieval, generation)
+    elif len(sys.argv) > 1 and sys.argv[1] == "compare":
+        from vectorstore import load_vectorstore
+
+        ks = tuple(int(x) for x in sys.argv[2:]) or (3, 5)
+        store = load_vectorstore()
+        print_comparison(compare_k(store, TEST_SET, ks=ks))
     else:
         _self_check()
