@@ -404,3 +404,184 @@ this phrasing. This is exactly the failure mode a pure similarity-threshold chec
 catch — high lexical/topical overlap with genuinely wrong content — and it's why the
 prompt also instructs the model to decline when *its* context is insufficient, not just
 the retriever. Two independent checks, two different failure modes covered.
+
+# Evaluation
+
+`eval.py`. A labeled test set plus two kinds of metrics: hand-rolled retrieval metrics
+(Hit Rate@k, MRR) and ragas LLM-as-judge generation metrics (faithfulness, answer
+relevancy, context precision).
+
+```bash
+python eval.py                         # wiring self-checks (no live calls)
+python eval.py live 5                  # full report at k=5: retrieval + ragas
+python eval.py live 5 --no-ragas       # retrieval only (fast, no LLM judge calls)
+```
+
+## The test set
+
+16 Q&A pairs against `assets/Python Programming.pdf` (`TEST_SET` in `eval.py`), each
+with an `expected_pages` tuple. The pages were picked by reading the book's chapter
+structure first (`Chapter N` headers, via `ingest.load_pdf`) and writing the question
+from the chapter content — **not** by running retrieval and checking what came back.
+Ground truth has to be independent of the system being measured, or the eval only
+confirms the retriever agrees with itself.
+
+## Hit Rate@k and MRR — a few lines, no library
+
+```python
+rank = next((i for i, p in enumerate(pages, start=1) if p in case.expected_pages), None)
+hit_rate = sum(r is not None for r in ranks) / len(ranks)
+mrr = sum(1 / r for r in ranks if r is not None) / len(ranks)
+```
+
+**Hit Rate@k**: fraction of questions where at least one expected page appears
+somewhere in the top-k retrieved chunks — a coarse "did retrieval fail outright"
+signal. **MRR** (Mean Reciprocal Rank): average of `1/rank` of the *first* correct
+hit (0 if none in top-k) — rewards the correct chunk appearing early, which matters
+because it's what the prompt puts first in context and what a user reads first in a
+citation list.
+
+## ragas: how the three metrics work, and their limits
+
+All three are **LLM-as-judge**: an LLM (not a formula) reads the question, the
+retrieved context, and the generated answer, and produces a verdict.
+
+- **Faithfulness**: the judge extracts the individual factual claims in the answer,
+  then checks each one against the retrieved context and reports the fraction that
+  are supported. Measures hallucination, not correctness against the real world — an
+  answer can be 100% faithful to context that is itself wrong.
+- **Answer relevancy**: the judge generates several *hypothetical questions* that the
+  given answer would be a good response to, embeds them, and averages their cosine
+  similarity to the real question. A correct-but-incomplete answer (e.g. missing part
+  of a multi-part question) can still score high, because the judge only sees "does
+  this answer look like it's addressing something in this direction."
+- **Context precision**: the judge scores each retrieved chunk as useful or not for
+  producing the reference answer, then computes precision weighted so
+  usefully-ranked-earlier chunks count more. This is the metric that overlaps most
+  with Hit Rate/MRR, but scores *usefulness for the answer*, not just topical rank.
+
+**Known biases/limitations, from ragas's own docs and observed here:**
+- **Self-preference bias**: a model tends to rate its own outputs' phrasing more
+  favorably than equally-correct answers worded differently. This is why the judge
+  here (`ornith:9b`, local) is deliberately not `settings.CHAT_MODEL` (the generator,
+  `gemma4:31b-cloud`) — grading your own homework is the textbook failure case.
+- **Judge quality caps score reliability**: all three metrics are only as good as the
+  judge's ability to extract claims / generate hypothetical questions / assess
+  usefulness. A small local model judging a much larger generator's answers can
+  itself misjudge, especially on claim decomposition for faithfulness.
+- **Cost/latency**: each metric is its own LLM call (or several, for claim
+  decomposition) per question. 16 questions x 3 metrics x 1 generation = 64 LLM calls
+  for one report — this doesn't scale to CI running per-commit without a much smaller
+  test set or a faster/cheaper judge.
+- **Non-determinism**: LLM judges don't give bit-identical scores run to run,
+  especially at nonzero temperature. `model_args=InstructorModelArgs(temperature=0.01)`
+  (ragas's own default) keeps this small but doesn't eliminate it — treat single-run
+  score deltas smaller than ~0.05 as noise, not signal.
+
+### Two real bugs hit wiring this up (both are genuine upstream issues, not typos)
+
+1. **`ragas` 0.4.3 fails to import at all** against the versions of `langchain-chroma`
+   and `langchain-community` this project already needs: `ragas/llms/base.py`
+   unconditionally does `from langchain_community.chat_models.vertexai import
+   ChatVertexAI`, a submodule current `langchain-community` (0.4.x, required by
+   `langchain-chroma>=1.1`) no longer ships — it moved to the standalone
+   `langchain-google-vertexai` package with no back-compat shim left behind. There is
+   no version of `langchain-community` that satisfies both: old enough to have that
+   submodule means `langchain-core<1.0`, which `langchain-chroma>=1.1` rejects.
+   Fixed with a placeholder module registered in `sys.modules` before importing ragas
+   (`eval.py`, top) — `ChatVertexAI` is never instantiated since Ollama is the judge,
+   so a class that's never used only needs to exist, not work.
+2. **Ollama's judge calls truncated mid-response**: ragas's `InstructorModelArgs`
+   defaults `max_tokens=1024`. `ornith:9b` is a reasoning model that spends tokens on
+   a `<think>` block before its structured JSON verdict, so 1024 wasn't enough and
+   every judge call raised `IncompleteOutputException`. `llm_factory()`'s own
+   `InstructorAdapter` always constructs its own `InstructorModelArgs()` and then
+   re-passes `**kwargs`, so passing `model_args=...` through `llm_factory` collides
+   with itself (`TypeError: got multiple values for keyword argument 'model_args'`) —
+   a real bug in ragas 0.4.3, not a usage error. Worked around by building
+   `InstructorLLM` directly (`eval.py`, `_judge_clients()`), bypassing `llm_factory`,
+   with `max_tokens=4096`.
+
+## Baseline report (chunk_size=1000/overlap=150, k=5)
+
+```
+Hit Rate@5: 1.000
+MRR@5:      0.830
+
+avg faithfulness:       1.000
+avg answer_relevancy:   0.903
+avg context_precision:  0.871
+```
+
+Faithfulness at 1.000 across all 16 questions is expected, not suspicious: the
+threshold-gated LCEL chain (issue #5) only generates when retrieval clears the
+relevance bar, and the prompt hard-instructs "answer only from context" — faithfulness
+specifically measures whether that instruction held, and on a textbook with
+non-adversarial questions it should.
+
+## Tuning iteration: k=3 -> k=5
+
+**Failure found.** Retrieval-only report at `k=3` (`python eval.py live 3 --no-ragas`):
+
+```
+Hit Rate@3: 0.875
+MRR@3:      0.802
+
+4 question(s) not a rank-1 hit:
+  rank=None  What is the recommended basic editor for writing your first Python programs?
+  rank=   2  What is the Python Standard Library?
+  rank=None  How do you print 'Hello World' in Python?
+  rank=   3  What is Anaconda?
+```
+
+Two outright misses (page not in top 3 at all) out of 16 questions.
+
+**Root cause.** Inspecting the actual retrieved chunks for the two misses:
+
+```
+"What is the recommended basic editor...?"  (expected page 30)
+  1. page 97  score=0.739  "you can use Python in that editor..."
+  2. page 25  score=0.715  "Which editor you should use depends on your background..."
+  3. page 97  score=0.697  "Chapter 16 Python Editors..."
+  ...
+  5. page 30  score=0.670  "Chapter 3 Start using Python... IDLE"        <- expected page
+
+"How do you print 'Hello World' in Python?"  (expected page 40)
+  1. page 43  score=0.569  "Variables of numeric types are created..."
+  2. page 31  score=0.563  "Example 3.2.1. Plotting in Python. Lets open your Python Editor and type"
+  3. page 107 score=0.561  "Figure 19.4: Python Interactive. We start by creating a basic Hello World"
+  4. page 40  score=0.549  "Chapter 4 Basic Python Programming..."        <- expected page
+```
+
+Both misses share the same cause: the book reuses near-identical example-intro
+boilerplate ("Lets open your Python Editor and type...") across many chapters, and
+discusses editors in three separate places (ch. 3's quick IDLE mention, the dedicated
+ch. 16 "Python Editors", and the ch. 2 comparison page). That lexical/topical overlap
+pushes the single specific chunk this test set names as "correct" to rank 4-5, not
+because retrieval is wrong, but because multiple chunks are legitimately
+about the same surface topic. At k=3, the correct chunk is cut off; it was never far
+away.
+
+**Fix.** Raise k from 3 to 5 — already what `chain.py`'s retriever defaults to
+(issue #5's `search_kwargs={"k": 5}`), so this is confirmation the existing default is
+load-bearing, not a new code change.
+
+**Re-run, improvement shown:**
+
+| | Hit Rate | MRR |
+| --- | --- | --- |
+| k=3 (before) | 0.875 (14/16) | 0.802 |
+| k=5 (after) | **1.000 (16/16)** | **0.830** |
+
+The generation-side metrics corroborate this independently: the "recommended basic
+editor" question has the lowest `context_precision` of the whole test set (0.59, vs.
+0.87 average) even at k=5 — ragas's judge is penalizing the same chunk-competition
+problem the retrieval numbers found, from the generation side. That agreement across
+two independently-computed metrics (one arithmetic, one LLM-judged) is itself a
+sanity check that neither is measuring noise.
+
+**What this doesn't fix**: k=5 recovers Hit Rate but MRR (0.830) is still short of a
+hypothetical 1.0 (every answer at rank 1) — the four questions listed above still rank
+their correct chunk 2nd-5th, they just now clear the "in top-5" bar. A chunk_size or
+embedding-model change might close that gap further; k was the cheapest, evidence-backed
+fix available and it was already correctly set.
