@@ -597,3 +597,103 @@ hypothetical 1.0 (every answer at rank 1) — the four questions listed above st
 their correct chunk 2nd-5th, they just now clear the "in top-5" bar. A chunk_size or
 embedding-model change might close that gap further; k was the cheapest, evidence-backed
 fix available and it was already correctly set.
+
+# CLI
+
+`cli.py`. The entry point wiring ingest (#2), chunking (#3), the vector store (#4),
+and the RAG chain (#5) into one tool.
+
+```bash
+python cli.py ingest <path-or-url>   # load -> chunk -> embed -> store
+python cli.py ask "<question>"       # retrieve -> generate -> streamed, cited answer
+python cli.py list                   # show ingested sources + chunk counts
+```
+
+## Config, in one place
+
+`config.py` (`Config`, a pydantic `BaseSettings` reading `.env`). Ollama host, model
+names, chunk size/overlap, retrieval `k`, and the relevance threshold were previously
+module-level constants scattered across `ingest.py`/`chunking.py`/`vectorstore.py`/
+`chain.py`; those modules now import their default from `settings` instead
+(`chunking.CHUNK_SIZE_CHARS = settings.CHUNK_SIZE`, etc. — aliased so existing imports
+elsewhere in the codebase keep working). `.env` only needs to set the three that have
+no sane default (`OLLAMA_URL`, `CHAT_MODEL`, `EMBED_MODEL`); `CHUNK_SIZE`,
+`CHUNK_OVERLAP`, `K`, `SCORE_THRESHOLD`, `PERSIST_DIR`, `COLLECTION_NAME` all have
+defaults and can be overridden the same way (env var or `.env` line) without touching
+code. `rag ingest`/`rag ask` also expose `--chunk-size`/`--chunk-overlap` and
+`-k`/`--threshold` as per-run overrides on top of the configured defaults.
+
+## Error handling
+
+- **Ollama not running**: every command checks `GET {OLLAMA_URL}` up front and fails
+  with `Can't reach Ollama at http://localhost:11434. Is it running? Try: ollama serve`
+  instead of a raw `ConnectionError` traceback surfacing from inside an embedding call.
+- **Bad file path**: `Error: No such file: no-such-file.pdf` (checked before any
+  loader runs).
+- **Wrong file type**: `Error: Only .pdf files and http(s) URLs are supported, got: README.md`.
+- **Unreachable URL**: the DNS/connection error is caught and re-raised with the URL
+  attached: `Error: Could not fetch https://.../page: [Errno 8] nodename nor servname
+  provided, or not known`.
+- **Empty store**: `rag ask`/`rag list` before anything is ingested:
+  `Error: Nothing has been ingested yet. Run \`rag ingest <path-or-url>\` first.`
+- All of the above exit non-zero with a one-line message on stderr, no traceback —
+  reserved for things the user caused and can fix, not for bugs.
+
+## Example session
+
+Real output, run against a fresh store (`assets/Python Programming.pdf` + a live URL):
+
+```
+$ python cli.py ingest "assets/Python Programming.pdf"
+Warning: assets/Python Programming.pdf page 2: no extractable text, likely a scan. OCR it separately (see docs/pdf-extraction.md).
+[... 15 more scanned-page warnings, from issue #2 ...]
+Ingested assets/Python Programming.pdf: 127 document(s) -> 195 chunks.
+
+$ python cli.py ingest "https://www.python.org/doc/essays/blurb/"
+Ingested https://www.python.org/doc/essays/blurb/: 1 document(s) -> 2 chunks.
+
+$ python cli.py list
+2 source(s), 197 chunk(s) total:
+
+   195 chunks  assets/Python Programming.pdf
+     2 chunks  https://www.python.org/doc/essays/blurb/
+
+$ python cli.py ask "What is Python and why is it good for rapid application development?"
+Python is an interpreted, high-level, general-purpose [2], object-oriented programming language with dynamic semantics [3]. It is open source, cross-platform [1], and was created by Guido van Rossum and first released in 1991 [1][2].
+
+Python is attractive for Rapid Application Development because it combines dynamic binding and dynamic typing with high-level built-in data structures [3].
+
+Sources:
+[1] assets/Python Programming.pdf, page 21
+[2] assets/Python Programming.pdf, page 15
+[3] https://www.python.org/doc/essays/blurb/, page 1
+[4] assets/Python Programming.pdf, page 17
+[5] assets/Python Programming.pdf, page 17
+```
+
+`[3]` is the URL source, cited for the "dynamic binding and dynamic typing" claim —
+which matches the blurb's actual text ("combined with dynamic typing and dynamic
+binding") word for word. One answer, grounded in and citing both an ingested PDF and
+an ingested web page, streamed token-by-token as it generated (the transcript above is
+the fully-collected output; streaming itself is exercised by `chain.answer_question`,
+issue #5).
+
+**Out-of-scope question, same store:**
+
+```
+$ python cli.py ask "What is the capital of France?"
+I don't know -- no relevant context found for that question.
+```
+
+**Error cases, all real runs:**
+
+```
+$ python cli.py ingest "no-such-file.pdf"
+Error: No such file: no-such-file.pdf
+
+$ PERSIST_DIR=/tmp/empty_store python cli.py ask "anything"
+Error: Nothing has been ingested yet. Run `rag ingest <path-or-url>` first.
+
+$ OLLAMA_URL=http://localhost:19999 python cli.py ask "what is python"
+Error: Can't reach Ollama at http://localhost:19999. Is it running? Try: ollama serve
+```

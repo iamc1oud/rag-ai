@@ -9,9 +9,14 @@ import tiktoken
 from langchain_core.documents import Document
 from langchain_text_splitters import CharacterTextSplitter, RecursiveCharacterTextSplitter
 
-# Chosen defaults -- reasoning in README.md ("Chunk size and overlap").
-CHUNK_SIZE_CHARS = 1000
-CHUNK_OVERLAP_CHARS = 150
+from config import settings
+
+# Chosen defaults -- reasoning in README.md ("Chunk size and overlap"). The
+# char-based ones live in config.py (settings.CHUNK_SIZE/CHUNK_OVERLAP) since
+# issue #7 wants chunk_size configured in one place, not as a module constant
+# here; aliased locally so existing callers/imports don't break.
+CHUNK_SIZE_CHARS = settings.CHUNK_SIZE
+CHUNK_OVERLAP_CHARS = settings.CHUNK_OVERLAP
 CHUNK_SIZE_TOKENS = 250
 CHUNK_OVERLAP_TOKENS = 40
 

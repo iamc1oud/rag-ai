@@ -21,8 +21,9 @@ from config import settings
 # unrelated context. Picked from measured scores on this corpus (README):
 # on-topic questions scored 0.62-0.70, off-topic 0.21-0.35. 0.45 sits in the
 # gap with margin on both sides; it is a property of this embedding model and
-# corpus, not a universal constant.
-RELEVANCE_THRESHOLD = 0.45
+# corpus, not a universal constant. Lives in config.py (settings.SCORE_THRESHOLD)
+# per issue #7; aliased here so existing imports keep working.
+RELEVANCE_THRESHOLD = settings.SCORE_THRESHOLD
 
 NO_CONTEXT_MESSAGE = "I don't know -- no relevant context found for that question."
 
@@ -45,7 +46,7 @@ def get_chat() -> ChatOllama:
     return ChatOllama(model=settings.CHAT_MODEL, base_url=settings.OLLAMA_URL, temperature=0)
 
 
-def get_retriever(store, k: int = 5):
+def get_retriever(store, k: int = settings.K):
     return store.as_retriever(search_kwargs={"k": k})
 
 
@@ -84,7 +85,7 @@ def build_chain(chat: ChatOllama | None = None):
 def answer_question(
     store: VectorStore,
     question: str,
-    k: int = 5,
+    k: int = settings.K,
     threshold: float = RELEVANCE_THRESHOLD,
     chat: ChatOllama | None = None,
 ) -> Iterator[str]:

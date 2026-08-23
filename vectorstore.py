@@ -6,17 +6,16 @@ Comparison against FAISS and the cosine-score sanity check: README.md
 
 from __future__ import annotations
 
-from pathlib import Path
-
 from langchain_chroma import Chroma
 from langchain_core.documents import Document
 from langchain_ollama import OllamaEmbeddings
 
 from config import settings
 
-# Default on-disk location for the persistent Chroma collection.
-PERSIST_DIR = str(Path(__file__).resolve().parent / "chroma_db")
-COLLECTION_NAME = "rag_ai"
+# Default on-disk location for the persistent Chroma collection. Configured
+# once in config.py (issue #7), aliased here so existing imports keep working.
+PERSIST_DIR = settings.PERSIST_DIR
+COLLECTION_NAME = settings.COLLECTION_NAME
 
 
 def get_embeddings() -> OllamaEmbeddings:
@@ -77,6 +76,28 @@ def load_vectorstore(
 def add_documents(store: Chroma, chunks: list[Document]) -> list[str]:
     """Embed and add more chunks to an already-open store. Persists immediately."""
     return store.add_documents(chunks)
+
+
+def list_sources(store: Chroma) -> dict[str, int]:
+    """{source: chunk_count} for every distinct source in the store, for `rag list`."""
+    metadatas = store._collection.get(include=["metadatas"])["metadatas"]
+    counts: dict[str, int] = {}
+    for metadata in metadatas:
+        source = metadata.get("source", "<unknown>")
+        counts[source] = counts.get(source, 0) + 1
+    return counts
+
+
+def store_exists(persist_directory: str = PERSIST_DIR) -> bool:
+    """Whether a Chroma collection has already been written to persist_directory.
+
+    Used to decide ingest -> create-new vs. add-to-existing, and to give a
+    clear "nothing ingested yet" error from `rag ask`/`rag list` instead of a
+    confusing empty-result or Chroma internal error.
+    """
+    from pathlib import Path
+
+    return (Path(persist_directory) / "chroma.sqlite3").exists()
 
 
 def index_pdf(path: str, persist_directory: str = PERSIST_DIR) -> Chroma:

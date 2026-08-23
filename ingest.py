@@ -21,7 +21,12 @@ import warnings
 from collections import Counter
 from pathlib import Path
 
+import httpx2
+from bs4 import BeautifulSoup
 from langchain_community.document_loaders import PyPDFLoader
+
+# Tags whose text is never article content -- stripped before extracting text.
+_WEB_NOISE_TAGS = ("script", "style", "nav", "header", "footer", "aside", "form")
 
 # A page yielding fewer than this many characters has no usable text layer.
 SCANNED_CHAR_THRESHOLD = 50
@@ -58,6 +63,36 @@ def load_pdf(path: str | Path) -> list[dict]:
         )
 
     return strip_boilerplate(records)
+
+
+def load_url(url: str, timeout: float = 15.0) -> list[dict]:
+    """Fetch a web page and return it as a single page record.
+
+    Same record shape as load_pdf() so chunking/vectorstore/chain don't need
+    to know or care whether a source was a PDF or a URL. A web page has no
+    natural page numbers, so page_number is always 1 -- the citation is the
+    URL itself, which is more useful than a page number for a web source
+    anyway.
+    """
+    try:
+        response = httpx2.get(url, timeout=timeout, follow_redirects=True,
+                               headers={"User-Agent": "rag-ai/0.1"})
+        response.raise_for_status()
+    except httpx2.HTTPError as e:
+        raise ConnectionError(f"Could not fetch {url}: {e}") from e
+
+    soup = BeautifulSoup(response.text, "html.parser")
+    for tag in soup.find_all(_WEB_NOISE_TAGS):
+        tag.decompose()
+
+    text = clean(soup.get_text(separator="\n"))
+    text = re.sub(r"\n{3,}", "\n\n", text).strip()  # collapse blank-line runs
+    is_scanned = len(text) < SCANNED_CHAR_THRESHOLD
+    if is_scanned:
+        warnings.warn(f"{url}: page yielded almost no text after stripping markup.",
+                       stacklevel=2)
+
+    return [{"source_file": url, "page_number": 1, "text": text, "is_scanned": is_scanned}]
 
 
 def clean(text: str) -> str:
@@ -138,7 +173,26 @@ def _self_check():
     tiny = [{"text": f"HEADER\nfirst {w}\nsecond {w}\nHEADER"} for w in bodies]
     assert strip_boilerplate(tiny)[0]["text"] == "first alpha\nsecond alpha"
 
-    sample = Path(__file__).resolve().parents[1] / "assets" / "Python Programming.pdf"
+    # web noise stripping, no network: a fake HTML page with nav/script/footer
+    # clutter around the one paragraph that should survive.
+    html = """
+    <html><body>
+      <nav>Home | About | Contact</nav>
+      <script>trackPageView();</script>
+      <article><p>LangChain is a framework for building context-aware apps.</p></article>
+      <footer>Copyright 2026</footer>
+    </body></html>
+    """
+    soup = BeautifulSoup(html, "html.parser")
+    for tag in soup.find_all(_WEB_NOISE_TAGS):
+        tag.decompose()
+    stripped = soup.get_text()
+    assert "LangChain is a framework" in stripped
+    assert "Home | About | Contact" not in stripped
+    assert "trackPageView" not in stripped
+    assert "Copyright 2026" not in stripped
+
+    sample = Path(__file__).resolve().parents[0] / "assets" / "Python Programming.pdf"
     if sample.exists():
         records = load_pdf(sample)
         assert len(records) == 143, len(records)

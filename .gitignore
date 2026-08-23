@@ -222,3 +222,4 @@ output.json
 
 # Local vector store
 chroma_db/
+demo_chroma_db/
