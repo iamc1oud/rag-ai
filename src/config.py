@@ -18,7 +18,7 @@ class Config(BaseSettings):
     CHUNK_OVERLAP: int = 150
     K: int = 5
     SCORE_THRESHOLD: float = 0.45
-    PERSIST_DIR: str = str(Path(__file__).resolve().parent / "chroma_db")
+    PERSIST_DIR: str = str(Path(__file__).resolve().parent.parent / "chroma_db")
     COLLECTION_NAME: str = "rag_ai"
 
     model_config = SettingsConfigDict(case_sensitive=False, env_file='.env')

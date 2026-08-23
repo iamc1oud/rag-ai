@@ -192,7 +192,7 @@ def _self_check():
     assert "trackPageView" not in stripped
     assert "Copyright 2026" not in stripped
 
-    sample = Path(__file__).resolve().parents[0] / "assets" / "Python Programming.pdf"
+    sample = Path(__file__).resolve().parents[1] / "assets" / "Python Programming.pdf"
     if sample.exists():
         records = load_pdf(sample)
         assert len(records) == 143, len(records)

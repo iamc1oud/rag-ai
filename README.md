@@ -2,6 +2,27 @@
 
 We will be using model `gemma4:31b-cloud` for agent.
 
+## Project layout
+
+All application code lives in `src/` (flat, no nested package -- every module
+imports its siblings directly, e.g. `from config import settings`). Run any
+module as a script from the repo root, e.g. `python src/cli.py ask "..."`; that
+puts `src/` on `sys.path` automatically, same as a one-off `PYTHONPATH=src
+python -c "..."`. `.env`, `assets/`, `chroma_db/`, and `docs/` stay at the repo
+root -- only source moved.
+
+```
+src/
+  cli.py         # entry point: rag ingest / ask / list
+  config.py      # settings, one place
+  ingest.py      # PDF + URL loaders
+  chunking.py    # text splitters
+  vectorstore.py # embeddings + Chroma
+  chain.py       # retrieval + generation (LCEL)
+  eval.py        # retrieval/generation quality harness
+  main.py        # FastAPI test endpoints
+```
+
 # Embedding Model
 `nomic-embed-text-v2-moe` is a multilingual MoE text embedding model that excels at multilingual retrieval.
 
@@ -12,7 +33,7 @@ We will be using model `gemma4:31b-cloud` for agent.
 
 # PDF Ingestion
 
-`ingest/lang_pdf_loader.py`. `load_pdf(path)` returns one record per page:
+`src/ingest.py`. `load_pdf(path)` returns one record per page:
 
 ```python
 {"source_file": "assets/bert-two-column.pdf", "page_number": 4,
@@ -23,8 +44,8 @@ We will be using model `gemma4:31b-cloud` for agent.
 1-based so they match what a reader sees.
 
 ```bash
-python ingest/lang_pdf_loader.py                   # self-checks
-python ingest/lang_pdf_loader.py assets/some.pdf   # dump page records to output.json
+python src/ingest.py                                # self-checks
+python src/ingest.py assets/some.pdf                # dump page records to output.json
 ```
 
 Text extraction is LangChain's `PyPDFLoader` (pypdf underneath) — no reason to
@@ -89,8 +110,8 @@ once on the parent Document and LangChain's `split_documents()` copies it onto e
 chunk unchanged — confirmed in `_self_check()`.
 
 ```bash
-python chunking.py                              # self-checks
-python chunking.py "assets/Python Programming.pdf"   # chunk a real PDF, print stats
+python src/chunking.py                          # self-checks
+python src/chunking.py "assets/Python Programming.pdf"   # chunk a real PDF, print stats
 ```
 
 ## Splitters compared
@@ -190,8 +211,8 @@ model-specific tokenizer just to size chunks.
 a persistent `Chroma` collection (`langchain-chroma`).
 
 ```bash
-python vectorstore.py                                          # wiring self-checks
-python vectorstore.py "assets/Python Programming.pdf" "python"  # index + query, live
+python src/vectorstore.py                                      # wiring self-checks
+python src/vectorstore.py "assets/Python Programming.pdf" "python"  # index + query, live
 ```
 
 ## Which endpoint OllamaEmbeddings calls
@@ -242,11 +263,11 @@ chunks — the filter is a real pre-search restriction, not ignored.
 ## Fresh-process reload + similarity_search(k=5)
 
 ```
-$ python -c "from vectorstore import index_pdf; index_pdf('assets/Python Programming.pdf')"
+$ PYTHONPATH=src python -c "from vectorstore import index_pdf; index_pdf('assets/Python Programming.pdf')"
 indexed: 195
 
 # separate python process, no import of index_pdf, only load_vectorstore()
-$ python -c "from vectorstore import load_vectorstore; s = load_vectorstore(); print(s._collection.count())"
+$ PYTHONPATH=src python -c "from vectorstore import load_vectorstore; s = load_vectorstore(); print(s._collection.count())"
 reloaded count: 195
 ```
 
@@ -312,8 +333,8 @@ retrieve -> relevance-threshold gate -> format numbered context -> prompt -> str
 append citations.
 
 ```bash
-python chain.py                                          # wiring self-checks
-python chain.py "How do I plot a sine function in matplotlib?"   # live, streamed
+python src/chain.py                                      # wiring self-checks
+python src/chain.py "How do I plot a sine function in matplotlib?"   # live, streamed
 ```
 
 ## How it's wired
@@ -412,9 +433,9 @@ the retriever. Two independent checks, two different failure modes covered.
 relevancy, context precision).
 
 ```bash
-python eval.py                         # wiring self-checks (no live calls)
-python eval.py live 5                  # full report at k=5: retrieval + ragas
-python eval.py live 5 --no-ragas       # retrieval only (fast, no LLM judge calls)
+python src/eval.py                     # wiring self-checks (no live calls)
+python src/eval.py live 5              # full report at k=5: retrieval + ragas
+python src/eval.py live 5 --no-ragas   # retrieval only (fast, no LLM judge calls)
 ```
 
 ## The test set
@@ -521,7 +542,7 @@ non-adversarial questions it should.
 
 ## Tuning iteration: k=3 -> k=5
 
-**Failure found.** Retrieval-only report at `k=3` (`python eval.py live 3 --no-ragas`):
+**Failure found.** Retrieval-only report at `k=3` (`python src/eval.py live 3 --no-ragas`):
 
 ```
 Hit Rate@3: 0.875
@@ -570,7 +591,7 @@ load-bearing, not a new code change.
 them in code — not just numbers copied into this doc by hand:
 
 ```bash
-$ python eval.py compare 3 5
+$ python src/eval.py compare 3 5
                                        k=3         k=5
 Hit Rate                             0.875       1.000
 MRR                                  0.802       0.830
@@ -604,9 +625,9 @@ fix available and it was already correctly set.
 and the RAG chain (#5) into one tool.
 
 ```bash
-python cli.py ingest <path-or-url>   # load -> chunk -> embed -> store
-python cli.py ask "<question>"       # retrieve -> generate -> streamed, cited answer
-python cli.py list                   # show ingested sources + chunk counts
+python src/cli.py ingest <path-or-url>   # load -> chunk -> embed -> store
+python src/cli.py ask "<question>"       # retrieve -> generate -> streamed, cited answer
+python src/cli.py list                   # show ingested sources + chunk counts
 ```
 
 ## Config, in one place
@@ -644,21 +665,21 @@ code. `rag ingest`/`rag ask` also expose `--chunk-size`/`--chunk-overlap` and
 Real output, run against a fresh store (`assets/Python Programming.pdf` + a live URL):
 
 ```
-$ python cli.py ingest "assets/Python Programming.pdf"
+$ python src/cli.py ingest "assets/Python Programming.pdf"
 Warning: assets/Python Programming.pdf page 2: no extractable text, likely a scan. OCR it separately (see docs/pdf-extraction.md).
 [... 15 more scanned-page warnings, from issue #2 ...]
 Ingested assets/Python Programming.pdf: 127 document(s) -> 195 chunks.
 
-$ python cli.py ingest "https://www.python.org/doc/essays/blurb/"
+$ python src/cli.py ingest "https://www.python.org/doc/essays/blurb/"
 Ingested https://www.python.org/doc/essays/blurb/: 1 document(s) -> 2 chunks.
 
-$ python cli.py list
+$ python src/cli.py list
 2 source(s), 197 chunk(s) total:
 
    195 chunks  assets/Python Programming.pdf
      2 chunks  https://www.python.org/doc/essays/blurb/
 
-$ python cli.py ask "What is Python and why is it good for rapid application development?"
+$ python src/cli.py ask "What is Python and why is it good for rapid application development?"
 Python is an interpreted, high-level, general-purpose [2], object-oriented programming language with dynamic semantics [3]. It is open source, cross-platform [1], and was created by Guido van Rossum and first released in 1991 [1][2].
 
 Python is attractive for Rapid Application Development because it combines dynamic binding and dynamic typing with high-level built-in data structures [3].
@@ -681,19 +702,19 @@ issue #5).
 **Out-of-scope question, same store:**
 
 ```
-$ python cli.py ask "What is the capital of France?"
+$ python src/cli.py ask "What is the capital of France?"
 I don't know -- no relevant context found for that question.
 ```
 
 **Error cases, all real runs:**
 
 ```
-$ python cli.py ingest "no-such-file.pdf"
+$ python src/cli.py ingest "no-such-file.pdf"
 Error: No such file: no-such-file.pdf
 
-$ PERSIST_DIR=/tmp/empty_store python cli.py ask "anything"
+$ PERSIST_DIR=/tmp/empty_store python src/cli.py ask "anything"
 Error: Nothing has been ingested yet. Run `rag ingest <path-or-url>` first.
 
-$ OLLAMA_URL=http://localhost:19999 python cli.py ask "what is python"
+$ OLLAMA_URL=http://localhost:19999 python src/cli.py ask "what is python"
 Error: Can't reach Ollama at http://localhost:19999. Is it running? Try: ollama serve
 ```
