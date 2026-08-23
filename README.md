@@ -33,15 +33,15 @@ src/
 
 # PDF Ingestion
 
-`src/ingest.py`. `load_pdf(path)` returns one record per page:
+`src/ingest.py`. `PDFLoader().load(path)` / `URLLoader().load(url)` return one
+`PageRecord` per page:
 
 ```python
-{"source_file": "assets/bert-two-column.pdf", "page_number": 4,
- "text": "...", "is_scanned": False}
+PageRecord(source="assets/bert-two-column.pdf", page=4, text="...", is_scanned=False)
 ```
 
-`source_file` + `page_number` are the citation key for issue #10. Page numbers are
-1-based so they match what a reader sees.
+`source` + `page` are the citation key for issue #10. Page numbers are 1-based so
+they match what a reader sees.
 
 ```bash
 python src/ingest.py                                # self-checks
@@ -66,9 +66,9 @@ Deliberately different kinds of messy:
 
 | Case | Found in | Handled? |
 | --- | --- | --- |
-| Repeated running header + page number | book, every page | **Yes.** `strip_boilerplate()` |
-| Hyphenation across line breaks | book, BERT | **Yes.** `clean()` |
-| Unmapped glyphs (`(cid:NNN)`) | pdfminer output for BERT | **Yes**, stripped in `clean()` — though pypdf maps most of them properly anyway (`⟨Question, Answer⟩` came through intact) |
+| Repeated running header + page number | book, every page | **Yes.** `BoilerplateStripper.strip()` |
+| Hyphenation across line breaks | book, BERT | **Yes.** `DocumentLoader.clean()` |
+| Unmapped glyphs (`(cid:NNN)`) | pdfminer output for BERT | **Yes**, stripped in `DocumentLoader.clean()` — though pypdf maps most of them properly anyway (`⟨Question, Answer⟩` came through intact) |
 | Pages with no text layer | book, 16 pages (chapter dividers that are one figure) | **Detected**, not fixed: flagged `is_scanned` with a warning |
 | Multi-column reading order | BERT (2 col), newspaper (~6 col) | **Yes, for free.** pypdf emits content-stream order, which in both files is column-by-column |
 | OCR noise | newspaper: `casualty ocoarred`, `hie reid`, `&6.` | **No.** See below |
@@ -103,16 +103,12 @@ geometry-aware extractor; `docs/pdf-extraction.md` records what the alternative 
 
 # Chunking
 
-`chunking.py`. `to_documents(records)` turns `ingest.load_pdf()` output into
-`langchain_core.documents.Document`s (dropping scanned/empty pages), then one of three
-splitters cuts them into retrieval-sized chunks. `metadata={"source", "page"}` is set
-once on the parent Document and LangChain's `split_documents()` copies it onto every
-chunk unchanged — confirmed in `_self_check()`.
-
-```bash
-python src/chunking.py                          # self-checks
-python src/chunking.py "assets/Python Programming.pdf"   # chunk a real PDF, print stats
-```
+`chunking.py`. `DocumentBuilder.from_records(records)` turns `PDFLoader`/`URLLoader`
+output into `langchain_core.documents.Document`s (dropping scanned/empty pages), then
+one of the `TextChunker` subclasses (`RecursiveChunker`, `NaiveChunker`, `TokenChunker`)
+cuts them into retrieval-sized chunks. `metadata={"source", "page"}` is set once on the
+parent Document and LangChain's `split_documents()` copies it onto every chunk
+unchanged.
 
 ## Splitters compared
 
@@ -236,7 +232,7 @@ one round trip's worth of batching, not 195.
 
 Both are embedded (no server), so that's a wash. The deciding factor is persistence
 model: Chroma treats "written = durable" as the default, so `build_vectorstore()` and
-`load_vectorstore()` in this file are ~10 lines total. FAISS makes persistence and
+`VectorStoreService.load()` in this file are ~10 lines total. FAISS makes persistence and
 metadata storage the caller's problem — doable, but it's exactly the kind of manual
 plumbing this project is trying to avoid by using LangChain integrations at all
 (see issue #1). Chosen: Chroma.
@@ -248,7 +244,7 @@ add + persist" as one call now, and `add_documents()` persists on every subseque
 
 ## Metadata filtering
 
-Each chunk's metadata (`{"source": ..., "page": ...}`, set in `chunking.to_documents`)
+Each chunk's metadata (`{"source": ..., "page": ...}`, set in `DocumentBuilder.from_records`)
 survives into Chroma untouched, so `similarity_search` can filter by it directly:
 
 ```python
@@ -263,11 +259,11 @@ chunks — the filter is a real pre-search restriction, not ignored.
 ## Fresh-process reload + similarity_search(k=5)
 
 ```
-$ PYTHONPATH=src python -c "from vectorstore import index_pdf; index_pdf('assets/Python Programming.pdf')"
+$ PYTHONPATH=src python -c "from vectorstore import VectorStoreService; from chunking import DocumentBuilder, RecursiveChunker; from ingest import PDFLoader; docs = DocumentBuilder.from_records(PDFLoader().load('assets/Python Programming.pdf')); VectorStoreService().build(RecursiveChunker().split(docs))"
 indexed: 195
 
-# separate python process, no import of index_pdf, only load_vectorstore()
-$ PYTHONPATH=src python -c "from vectorstore import load_vectorstore; s = load_vectorstore(); print(s._collection.count())"
+# separate python process, only VectorStoreService().load()
+$ PYTHONPATH=src python -c "from vectorstore import VectorStoreService; s = VectorStoreService().load(); print(s._collection.count())"
 reloaded count: 195
 ```
 
@@ -340,21 +336,22 @@ python src/chain.py "How do I plot a sine function in matplotlib?"   # live, str
 ## How it's wired
 
 ```python
-scored = store.similarity_search_with_relevance_scores(question, k=5)
-if not scored or scored[0][1] < RELEVANCE_THRESHOLD:
-    yield NO_CONTEXT_MESSAGE
+# RagChain.answer():
+scored = self.store.similarity_search_with_relevance_scores(question, k=k)
+if not scored or scored[0][1] < threshold:
+    yield self.NO_CONTEXT_MESSAGE
     return                                    # no LLM call at all
 
-chain = prompt | ChatOllama(...) | StrOutputParser()
-for token in chain.stream({"context": format_docs(docs), "question": question}):
+for token in self._chain.stream({"context": context, "question": question}):
     yield token
-yield format_citations(docs)
+yield self.format_citations(docs)
 ```
 
-The threshold check runs *before* the LCEL chain, not as a step inside it: it has to be
-able to veto generation entirely, and by the time a `RunnableLambda` inside a chain
-sees the retrieved docs, the chain is already committed to calling the model. Keeping
-it as a plain Python `if` ahead of `chain.stream(...)` is also the only way to make the
+`self._chain` is built once in `__init__` (`prompt | ChatOllama(...) | StrOutputParser()`).
+The threshold check runs *before* it, not as a step inside it: it has to be able to veto
+generation entirely, and by the time a `RunnableLambda` inside a chain sees the
+retrieved docs, the chain is already committed to calling the model. Keeping it as a
+plain Python `if` ahead of `self._chain.stream(...)` is also the only way to make the
 "no LLM call for out-of-scope questions" behavior fast and certain rather than a prompt
 instruction the model could ignore.
 
@@ -696,7 +693,7 @@ Sources:
 which matches the blurb's actual text ("combined with dynamic typing and dynamic
 binding") word for word. One answer, grounded in and citing both an ingested PDF and
 an ingested web page, streamed token-by-token as it generated (the transcript above is
-the fully-collected output; streaming itself is exercised by `chain.answer_question`,
+the fully-collected output; streaming itself is exercised by `RagChain.answer`,
 issue #5).
 
 **Out-of-scope question, same store:**

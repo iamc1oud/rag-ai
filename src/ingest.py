@@ -1,180 +1,155 @@
-"""PDF -> page records, via LangChain's PyPDFLoader.
-
-PyPDFLoader (pypdf underneath) gives us page text plus source/page metadata, so
-that part is not rewritten here. What it does not do is clean the text: every
-function below exists because a real PDF in assets/ broke without it. See
-docs/pdf-extraction.md for the library comparison and the measured limits.
-
-A page record is a plain dict:
-    {
-      "source_file": "assets/Python Programming.pdf",  # for citations (issue #10)
-      "page_number": 12,                               # 1-based, as a reader sees it
-      "text": "...",
-      "is_scanned": False,   # no extractable text -> needs OCR
-    }
-"""
+"""Document loaders -> PageRecord. Library choice and messy-PDF handling: README.md."""
 
 from __future__ import annotations
 
 import re
 import warnings
+from abc import ABC, abstractmethod
 from collections import Counter
+from dataclasses import dataclass
 from pathlib import Path
 
 import httpx2
 from bs4 import BeautifulSoup
 from langchain_community.document_loaders import PyPDFLoader
 
-# Tags whose text is never article content -- stripped before extracting text.
-_WEB_NOISE_TAGS = ("script", "style", "nav", "header", "footer", "aside", "form")
 
-# A page yielding fewer than this many characters has no usable text layer.
-SCANNED_CHAR_THRESHOLD = 50
-
-# Lines from the top/bottom of each page that are candidates for boilerplate.
-BOILERPLATE_EDGE_LINES = 3
-
-# A candidate line must repeat on at least this fraction of pages to be stripped.
-BOILERPLATE_PAGE_RATIO = 0.5
+@dataclass
+class PageRecord:
+    source: str
+    page: int
+    text: str
+    is_scanned: bool = False
 
 
-def load_pdf(path: str | Path) -> list[dict]:
-    """Extract one record per page, cleaned, with repeated boilerplate stripped."""
-    path = Path(path)
-    source_file = str(path)
-    records = []
+class BoilerplateStripper:
+    """Drops running headers/footers/page numbers repeated across pages."""
 
-    for page_number, doc in enumerate(PyPDFLoader(source_file).lazy_load(), start=1):
-        text = clean(doc.page_content)
-        is_scanned = len(text.strip()) < SCANNED_CHAR_THRESHOLD
-        if is_scanned:
-            warnings.warn(
-                f"{source_file} page {page_number}: no extractable text, likely a "
-                f"scan. OCR it separately (see docs/pdf-extraction.md).",
-                stacklevel=2,
+    EDGE_LINES = 3
+    PAGE_RATIO = 0.5
+
+    @classmethod
+    def strip(cls, records: list[PageRecord]) -> list[PageRecord]:
+        if len(records) < 3:
+            return records
+
+        counts = Counter()
+        for record in records:
+            head, _, tail = cls._split_edges(record.text.splitlines())
+            counts.update({cls._mask(line) for line in head + tail if line.strip()})
+
+        threshold = max(3, int(len(records) * cls.PAGE_RATIO))
+        boilerplate = {key for key, count in counts.items() if count >= threshold}
+        if not boilerplate:
+            return records
+
+        for record in records:
+            head, middle, tail = cls._split_edges(record.text.splitlines())
+            head = [line for line in head if cls._mask(line) not in boilerplate]
+            tail = [line for line in tail if cls._mask(line) not in boilerplate]
+            record.text = "\n".join(head + middle + tail).strip()
+        return records
+
+    @classmethod
+    def _split_edges(cls, lines: list[str]) -> tuple[list[str], list[str], list[str]]:
+        edge = cls.EDGE_LINES
+        if len(lines) <= 2 * edge:
+            half = len(lines) // 2
+            return lines[:half], [], lines[half:]
+        return lines[:edge], lines[edge:-edge], lines[-edge:]
+
+    @staticmethod
+    def _mask(line: str) -> str:
+        return re.sub(r"\d+", "#", line.strip())
+
+
+class DocumentLoader(ABC):
+    SCANNED_CHAR_THRESHOLD = 50
+
+    @abstractmethod
+    def load(self, source: str) -> list[PageRecord]: ...
+
+    @staticmethod
+    def clean(text: str) -> str:
+        """Rejoin hyphenated line breaks; drop glyphs the parser couldn't map."""
+        text = re.sub(r"(\w)-\n(\w)", r"\1\2", text)
+        return re.sub(r"\(cid:\d+\)", "", text)
+
+
+class PDFLoader(DocumentLoader):
+    def load(self, path: str | Path) -> list[PageRecord]:
+        source = str(path)
+        records = []
+        for page, doc in enumerate(PyPDFLoader(source).lazy_load(), start=1):
+            text = self.clean(doc.page_content)
+            is_scanned = len(text.strip()) < self.SCANNED_CHAR_THRESHOLD
+            if is_scanned:
+                warnings.warn(
+                    f"{source} page {page}: no extractable text, likely a scan. "
+                    f"OCR it separately.",
+                    stacklevel=2,
+                )
+            records.append(PageRecord(source=source, page=page, text=text, is_scanned=is_scanned))
+        return BoilerplateStripper.strip(records)
+
+
+class URLLoader(DocumentLoader):
+    """Fetches a web page as a single PageRecord (page=1, no pagination)."""
+
+    NOISE_TAGS = ("script", "style", "nav", "header", "footer", "aside", "form")
+
+    def load(self, url: str, timeout: float = 15.0) -> list[PageRecord]:
+        try:
+            response = httpx2.get(
+                url, timeout=timeout, follow_redirects=True,
+                headers={"User-Agent": "rag-ai/0.1"},
             )
-        records.append(
-            {
-                "source_file": source_file,
-                "page_number": page_number,
-                "text": text,
-                "is_scanned": is_scanned,
-            }
-        )
+            response.raise_for_status()
+        except httpx2.HTTPError as e:
+            raise ConnectionError(f"Could not fetch {url}: {e}") from e
 
-    return strip_boilerplate(records)
+        soup = BeautifulSoup(response.text, "html.parser")
+        for tag in soup.find_all(self.NOISE_TAGS):
+            tag.decompose()
 
-
-def load_url(url: str, timeout: float = 15.0) -> list[dict]:
-    """Fetch a web page and return it as a single page record.
-
-    Same record shape as load_pdf() so chunking/vectorstore/chain don't need
-    to know or care whether a source was a PDF or a URL. A web page has no
-    natural page numbers, so page_number is always 1 -- the citation is the
-    URL itself, which is more useful than a page number for a web source
-    anyway.
-    """
-    try:
-        response = httpx2.get(url, timeout=timeout, follow_redirects=True,
-                               headers={"User-Agent": "rag-ai/0.1"})
-        response.raise_for_status()
-    except httpx2.HTTPError as e:
-        raise ConnectionError(f"Could not fetch {url}: {e}") from e
-
-    soup = BeautifulSoup(response.text, "html.parser")
-    for tag in soup.find_all(_WEB_NOISE_TAGS):
-        tag.decompose()
-
-    text = clean(soup.get_text(separator="\n"))
-    text = re.sub(r"\n{3,}", "\n\n", text).strip()  # collapse blank-line runs
-    is_scanned = len(text) < SCANNED_CHAR_THRESHOLD
-    if is_scanned:
-        warnings.warn(f"{url}: page yielded almost no text after stripping markup.",
-                       stacklevel=2)
-
-    return [{"source_file": url, "page_number": 1, "text": text, "is_scanned": is_scanned}]
-
-
-def clean(text: str) -> str:
-    """Rejoin hyphenated line breaks and drop glyphs pypdf could not map.
-
-    "informa-\\ntion" -> "information". A font with no usable ToUnicode table
-    yields "(cid:104)" placeholders; they are noise to an embedding model.
-    """
-    text = re.sub(r"(\w)-\n(\w)", r"\1\2", text)
-    return re.sub(r"\(cid:\d+\)", "", text)
-
-
-def strip_boilerplate(records: list[dict]) -> list[dict]:
-    """Drop running headers/footers/page numbers that repeat across pages.
-
-    Page numbers differ per page, so compare with digit runs masked out.
-    """
-    if len(records) < 3:
-        return records
-
-    counts = Counter()
-    for record in records:
-        head, _, tail = _split_edges(record["text"].splitlines())
-        counts.update({_mask(line) for line in head + tail if line.strip()})
-
-    threshold = max(3, int(len(records) * BOILERPLATE_PAGE_RATIO))
-    boilerplate = {key for key, count in counts.items() if count >= threshold}
-    if not boilerplate:
-        return records
-
-    for record in records:
-        head, middle, tail = _split_edges(record["text"].splitlines())
-        head = [line for line in head if _mask(line) not in boilerplate]
-        tail = [line for line in tail if _mask(line) not in boilerplate]
-        record["text"] = "\n".join(head + middle + tail).strip()
-    return records
-
-
-def _split_edges(lines: list[str]) -> tuple[list[str], list[str], list[str]]:
-    """(head, middle, tail) with no overlap even on pages of very few lines."""
-    edge = BOILERPLATE_EDGE_LINES
-    if len(lines) <= 2 * edge:
-        half = len(lines) // 2
-        return lines[:half], [], lines[half:]
-    return lines[:edge], lines[edge:-edge], lines[-edge:]
-
-
-def _mask(line: str) -> str:
-    return re.sub(r"\d+", "#", line.strip())
+        text = self.clean(soup.get_text(separator="\n"))
+        text = re.sub(r"\n{3,}", "\n\n", text).strip()
+        is_scanned = len(text) < self.SCANNED_CHAR_THRESHOLD
+        if is_scanned:
+            warnings.warn(f"{url}: page yielded almost no text after stripping markup.",
+                          stacklevel=2)
+        return [PageRecord(source=url, page=1, text=text, is_scanned=is_scanned)]
 
 
 def _self_check():
-    assert clean("informa-\ntion flow") == "information flow"
-    assert clean("well-\nknown") == "wellknown"  # can't tell real hyphens apart
-    assert clean("end -\n5") == "end -\n5"  # not a word split, left alone
-    assert clean("(cid:104)Question(cid:105)") == "Question"
+    assert DocumentLoader.clean("informa-\ntion flow") == "information flow"
+    assert DocumentLoader.clean("well-\nknown") == "wellknown"
+    assert DocumentLoader.clean("end -\n5") == "end -\n5"
+    assert DocumentLoader.clean("(cid:104)Question(cid:105)") == "Question"
 
     bodies = "alpha beta gamma delta epsilon zeta eta theta iota kappa".split()
     pages = [
-        {"text": f"Python Programming\n{word} opens the page\nsecond {word} line\n"
-                 f"a repeated middle line\nthird {word} line\n{word} closes it\n"
-                 f"CHAPTER FOOTER\nPage {i} of 10"}
+        PageRecord(source="s", page=i,
+                   text=f"Python Programming\n{word} opens the page\nsecond {word} line\n"
+                        f"a repeated middle line\nthird {word} line\n{word} closes it\n"
+                        f"CHAPTER FOOTER\nPage {i} of 10")
         for i, word in enumerate(bodies, start=1)
     ]
-    first = strip_boilerplate(pages)[0]["text"]
-    assert "Python Programming" not in first, first  # running head
+    first = BoilerplateStripper.strip(pages)[0].text
+    assert "Python Programming" not in first, first
     assert "CHAPTER FOOTER" not in first, first
-    assert "Page 1 of 10" not in first, first  # page number, matched after masking
-    assert "alpha opens the page" in first, first
-    assert "alpha closes it" in first, first
-    # only head/tail lines are candidates, so a repeat in the body survives
-    assert "a repeated middle line" in first, first
+    assert "Page 1 of 10" not in first, first
+    assert "alpha opens the page" in first and "alpha closes it" in first
+    assert "a repeated middle line" in first
 
-    short = [{"text": "HEADER\nx"}, {"text": "HEADER\ny"}]
-    assert strip_boilerplate(short) == short  # too few pages to be confident
+    short = [PageRecord(source="s", page=1, text="HEADER\nx"),
+             PageRecord(source="s", page=2, text="HEADER\ny")]
+    assert [r.text for r in BoilerplateStripper.strip(short)] == [r.text for r in short]
 
-    # a 4-line page: head and tail must not overlap and duplicate lines
-    tiny = [{"text": f"HEADER\nfirst {w}\nsecond {w}\nHEADER"} for w in bodies]
-    assert strip_boilerplate(tiny)[0]["text"] == "first alpha\nsecond alpha"
+    tiny = [PageRecord(source="s", page=i, text=f"HEADER\nfirst {w}\nsecond {w}\nHEADER")
+            for i, w in enumerate(bodies)]
+    assert BoilerplateStripper.strip(tiny)[0].text == "first alpha\nsecond alpha"
 
-    # web noise stripping, no network: a fake HTML page with nav/script/footer
-    # clutter around the one paragraph that should survive.
     html = """
     <html><body>
       <nav>Home | About | Contact</nav>
@@ -184,7 +159,7 @@ def _self_check():
     </body></html>
     """
     soup = BeautifulSoup(html, "html.parser")
-    for tag in soup.find_all(_WEB_NOISE_TAGS):
+    for tag in soup.find_all(URLLoader.NOISE_TAGS):
         tag.decompose()
     stripped = soup.get_text()
     assert "LangChain is a framework" in stripped
@@ -194,25 +169,24 @@ def _self_check():
 
     sample = Path(__file__).resolve().parents[1] / "assets" / "Python Programming.pdf"
     if sample.exists():
-        records = load_pdf(sample)
+        records = PDFLoader().load(sample)
         assert len(records) == 143, len(records)
-        assert [r["page_number"] for r in records] == list(range(1, 144))
-        assert all(r["source_file"] == str(sample) for r in records)
-        assert sum(1 for r in records if r["text"].strip()) > 100
+        assert [r.page for r in records] == list(range(1, 144))
+        assert all(r.source == str(sample) for r in records)
+        assert sum(1 for r in records if r.text.strip()) > 100
         print(f"ok: {len(records)} pages")
     else:
         print("ok (unit checks only; no sample PDF)")
 
 
 if __name__ == "__main__":
-    # No argument: run the checks. With a PDF path: dump its page records to
-    # output.json for eyeballing.
     import json
     import sys
+    from dataclasses import asdict
 
     if len(sys.argv) > 1:
-        records = load_pdf(sys.argv[1])
-        Path("output.json").write_text(json.dumps(records, indent=2))
+        records = PDFLoader().load(sys.argv[1])
+        Path("output.json").write_text(json.dumps([asdict(r) for r in records], indent=2))
         print(f"{len(records)} page records -> output.json")
     else:
         _self_check()

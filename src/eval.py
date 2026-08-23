@@ -1,7 +1,7 @@
-"""Retrieval + generation quality harness for the RAG chain (chain.py).
+"""Retrieval + generation quality harness for RagChain.
 
-Test set, the tuning iteration (failure -> root cause -> fix -> re-run), and
-the ragas LLM-as-judge research/caveats: README.md ("Evaluation" section).
+Test set, the tuning iteration, and the ragas LLM-as-judge research/caveats:
+README.md ("Evaluation" section).
 """
 
 from __future__ import annotations
@@ -18,13 +18,9 @@ from config import settings
 # at import time. Current langchain-community (required by langchain-chroma
 # 1.x, which requires langchain-core>=1.1) no longer ships that submodule --
 # it moved to the standalone langchain-google-vertexai package with no
-# back-compat shim left in community. Pinning community old enough to have it
-# breaks chroma (needs langchain-core>=1.1; that old community needs <1.0),
-# so there is no version combination that satisfies both packages' real
-# requirements. We never instantiate ChatVertexAI here (Ollama is the judge),
-# so a placeholder registered before the import satisfies ragas's import
-# without needing real Vertex AI support. Real upstream incompatibility,
-# verified by tracing both packages' actual code, not a guess.
+# back-compat shim left in community. No version of langchain-community
+# satisfies both packages at once. ChatVertexAI is never instantiated here
+# (Ollama is the judge), so a placeholder module satisfies the import.
 _vertexai_shim = types.ModuleType("langchain_community.chat_models.vertexai")
 
 
@@ -48,34 +44,18 @@ from ragas.metrics.collections import (  # noqa: E402
     Faithfulness,
 )
 
-# ragas's default max_tokens (1024, via InstructorModelArgs) truncates ornith:9b
-# mid-response: it's a reasoning model that spends tokens on a <think> block
-# before the structured JSON verdict, so the low default cuts it off before
-# the answer. llm_factory() has no way to override model_args without a
-# kwarg collision in ragas 0.4.3's InstructorAdapter (it always constructs
-# its own InstructorModelArgs() and then re-passes **kwargs, so a caller's
-# model_args collides). Building InstructorLLM directly sidesteps that.
-
-# The ragas judge is deliberately NOT settings.CHAT_MODEL (the generator).
-# Grading your own generations with the same model is a known ragas failure
-# mode (self-preference bias -- a model rates its own phrasing/style higher
-# than an equally correct answer worded differently). Using a different,
-# smaller local model as judge avoids that and avoids paying for judge calls
-# on the cloud model. See README for the fuller bias discussion.
-JUDGE_MODEL = "ornith:9b"
-
 
 @dataclass
 class TestCase:
     question: str
-    expected_answer: str  # short reference answer, for a human reading the report
+    expected_answer: str
     expected_pages: tuple[int, ...]  # any chunk from these pages counts as relevant
 
 
 # 16 Q&A pairs against assets/Python Programming.pdf. expected_pages was
-# determined by reading the source chapter each question targets (ingest.py
-# output), not by running retrieval first -- ground truth has to be
-# independent of the system being measured.
+# determined by reading the source chapter each question targets, not by
+# running retrieval first -- ground truth must be independent of the system
+# being measured.
 TEST_SET = [
     TestCase("What year was Python first released?", "1991", (21,)),
     TestCase("What is CPython?",
@@ -115,142 +95,152 @@ TEST_SET = [
 ]
 
 
-def retrieve_pages(store, question: str, k: int) -> list[int]:
-    docs = store.similarity_search(question, k=k)
-    return [doc.metadata.get("page") for doc in docs]
+@dataclass
+class RetrievalReport:
+    k: int
+    hit_rate: float
+    mrr: float
+    ranks: list[tuple[TestCase, int | None]]
 
 
-def retrieval_metrics(store, test_set: list[TestCase], k: int) -> dict:
-    """Hit Rate@k and MRR@k, plus the per-question ranks (for failure analysis).
+@dataclass
+class ComparisonReport:
+    ks: tuple[int, ...]
+    runs: list[RetrievalReport]
+    rows: list[dict]  # {"question": str, "ranks": [rank_at_each_k]}
 
-    Hit Rate@k: fraction of questions where at least one expected page appears
-    in the top k retrieved chunks.
-    MRR: mean of 1/rank of the first expected-page hit (0 if none in top k).
-    Both are a few lines of arithmetic -- no eval library needed for these two.
-    """
-    ranks = []
-    for case in test_set:
-        pages = retrieve_pages(store, case.question, k)
-        rank = next(
-            (i for i, p in enumerate(pages, start=1) if p in case.expected_pages), None
+
+class RetrievalEvaluator:
+    """Hit Rate@k and MRR -- a few lines of arithmetic, no eval library needed."""
+
+    def __init__(self, store, test_set: list[TestCase] = TEST_SET):
+        self.store = store
+        self.test_set = test_set
+
+    def _rank(self, case: TestCase, k: int) -> int | None:
+        docs = self.store.similarity_search(case.question, k=k)
+        pages = [d.metadata.get("page") for d in docs]
+        return next((i for i, p in enumerate(pages, start=1) if p in case.expected_pages), None)
+
+    def evaluate(self, k: int) -> RetrievalReport:
+        ranks = [(case, self._rank(case, k)) for case in self.test_set]
+        hits = [rank is not None for _, rank in ranks]
+        return RetrievalReport(
+            k=k,
+            hit_rate=sum(hits) / len(hits),
+            mrr=sum(1 / rank for _, rank in ranks if rank is not None) / len(ranks),
+            ranks=ranks,
         )
-        ranks.append(rank)
 
-    hits = [r is not None for r in ranks]
-    return {
-        "k": k,
-        "hit_rate": sum(hits) / len(hits),
-        "mrr": sum(1 / r for r in ranks if r is not None) / len(ranks),
-        "ranks": list(zip(test_set, ranks)),
-    }
-
-
-def _judge_clients():
-    client = AsyncOpenAI(base_url=f"{settings.OLLAMA_URL}/v1", api_key="ollama")
-    patched_client = _get_instructor_client(client, "openai")
-    llm = InstructorLLM(
-        client=patched_client,
-        model=JUDGE_MODEL,
-        provider="openai",
-        model_args=InstructorModelArgs(max_tokens=4096),
-    )
-    embeddings = embedding_factory("openai", model=settings.EMBED_MODEL, client=client)
-    return llm, embeddings
+    def compare(self, ks: tuple[int, ...] = (3, 5)) -> ComparisonReport:
+        """Before/after table across k values -- the tuning iteration, in code."""
+        runs = [self.evaluate(k) for k in ks]
+        rows = [
+            {"question": case.question, "ranks": [run.ranks[i][1] for run in runs]}
+            for i, case in enumerate(self.test_set)
+        ]
+        return ComparisonReport(ks=ks, runs=runs, rows=rows)
 
 
-async def _generation_metrics_async(store, test_set: list[TestCase], k: int) -> dict:
-    """Faithfulness, answer relevancy, and context precision, via ragas + Ollama.
+class RagasJudge:
+    """LLM-as-judge for faithfulness, answer relevancy, and context precision.
 
-    Faithfulness: does the answer only claim things the retrieved context
-    supports? Answer relevancy: does the answer actually address the
-    question? Context precision: are the top-ranked retrieved chunks the
-    ones actually useful for answering? All three are LLM-as-judge metrics
-    (see README for how ragas computes each and their known limitations).
+    Deliberately NOT settings.CHAT_MODEL (the generator) -- grading your own
+    generations is ragas's documented self-preference bias. A different,
+    smaller local model avoids that and avoids paying for judge calls on the
+    cloud generator. What each metric measures and its limits: README.md.
     """
-    import warnings
 
-    from chain import build_chain, format_docs
+    MODEL = "ornith:9b"
 
-    warnings.filterwarnings("ignore")
-    llm, embeddings = _judge_clients()
-    faithfulness = Faithfulness(llm=llm)
-    answer_relevancy = AnswerRelevancy(llm=llm, embeddings=embeddings)
-    context_precision = ContextPrecisionWithoutReference(llm=llm)
-    chain = build_chain()
+    def __init__(self):
+        client = AsyncOpenAI(base_url=f"{settings.OLLAMA_URL}/v1", api_key="ollama")
+        llm = InstructorLLM(
+            client=_get_instructor_client(client, "openai"),
+            model=self.MODEL,
+            provider="openai",
+            # ragas's default max_tokens (1024) truncates ornith:9b mid-response
+            # (it spends tokens on a <think> block before the structured JSON
+            # verdict); llm_factory() can't override model_args without a kwarg
+            # collision in ragas 0.4.3, so InstructorLLM is built directly here.
+            model_args=InstructorModelArgs(max_tokens=4096),
+        )
+        embeddings = embedding_factory("openai", model=settings.EMBED_MODEL, client=client)
+        self.faithfulness = Faithfulness(llm=llm)
+        self.answer_relevancy = AnswerRelevancy(llm=llm, embeddings=embeddings)
+        self.context_precision = ContextPrecisionWithoutReference(llm=llm)
 
-    rows = []
-    for case in test_set:
-        docs = store.similarity_search(case.question, k=k)
-        contexts = [d.page_content for d in docs]
-        answer = chain.invoke({"context": format_docs(docs), "question": case.question})
-
+    async def score(self, question: str, answer: str, contexts: list[str]) -> dict:
         f, r, p = await asyncio.gather(
-            faithfulness.ascore(
-                user_input=case.question, response=answer, retrieved_contexts=contexts
-            ),
-            answer_relevancy.ascore(user_input=case.question, response=answer),
-            context_precision.ascore(
-                user_input=case.question, response=answer, retrieved_contexts=contexts
-            ),
+            self.faithfulness.ascore(user_input=question, response=answer,
+                                     retrieved_contexts=contexts),
+            self.answer_relevancy.ascore(user_input=question, response=answer),
+            self.context_precision.ascore(user_input=question, response=answer,
+                                          retrieved_contexts=contexts),
         )
-        rows.append(
-            {
-                "question": case.question,
-                "answer": answer,
-                "faithfulness": f.value,
-                "answer_relevancy": r.value,
-                "context_precision": p.value,
-            }
+        return {"faithfulness": f.value, "answer_relevancy": r.value, "context_precision": p.value}
+
+
+@dataclass
+class GenerationReport:
+    avg_faithfulness: float
+    avg_answer_relevancy: float
+    avg_context_precision: float
+    rows: list[dict]
+
+
+class GenerationEvaluator:
+    """Faithfulness/relevancy/precision for RagChain's generated answers."""
+
+    def __init__(self, store, chain, judge: RagasJudge | None = None,
+                 test_set: list[TestCase] = TEST_SET):
+        self.store = store
+        self.chain = chain
+        self.judge = judge or RagasJudge()
+        self.test_set = test_set
+
+    async def _evaluate_async(self, k: int) -> GenerationReport:
+        rows = []
+        for case in self.test_set:
+            docs = self.store.similarity_search(case.question, k=k)
+            contexts = [d.page_content for d in docs]
+            answer = self.chain.generate(case.question, docs)
+            scores = await self.judge.score(case.question, answer, contexts)
+            rows.append({"question": case.question, "answer": answer, **scores})
+
+        n = len(rows)
+        return GenerationReport(
+            avg_faithfulness=sum(r["faithfulness"] for r in rows) / n,
+            avg_answer_relevancy=sum(r["answer_relevancy"] for r in rows) / n,
+            avg_context_precision=sum(r["context_precision"] for r in rows) / n,
+            rows=rows,
         )
 
-        print(f"question: {case.question}")
-        print(f"answer: {answer}")
-        print(f"faithfulness: {f.value}")
-        print(f"answer_relevancy: {r.value}")
-        print(f"context_precision: {p.value}")
-        print('--------')
-
-    n = len(rows)
-    return {
-        "avg_faithfulness": sum(r["faithfulness"] for r in rows) / n,
-        "avg_answer_relevancy": sum(r["answer_relevancy"] for r in rows) / n,
-        "avg_context_precision": sum(r["context_precision"] for r in rows) / n,
-        "rows": rows,
-    }
+    def evaluate(self, k: int) -> GenerationReport:
+        return asyncio.run(self._evaluate_async(k))
 
 
-def generation_metrics(store, test_set: list[TestCase] = TEST_SET, k: int = 5) -> dict:
-    return asyncio.run(_generation_metrics_async(store, test_set, k))
+def print_report(retrieval: RetrievalReport, generation: GenerationReport | None = None) -> None:
+    print(f"Hit Rate@{retrieval.k}: {retrieval.hit_rate:.3f}")
+    print(f"MRR@{retrieval.k}:      {retrieval.mrr:.3f}")
+    misses = [(case, rank) for case, rank in retrieval.ranks if rank is None or rank > 1]
+    if misses:
+        print(f"\n{len(misses)} question(s) not a rank-1 hit:")
+        for case, rank in misses:
+            print(f"  rank={rank!s:>4}  {case.question}")
+    if generation:
+        print(f"\navg faithfulness:       {generation.avg_faithfulness:.3f}")
+        print(f"avg answer_relevancy:   {generation.avg_answer_relevancy:.3f}")
+        print(f"avg context_precision:  {generation.avg_context_precision:.3f}")
 
 
-def compare_k(store, test_set: list[TestCase], ks: tuple[int, ...] = (3, 5)) -> dict:
-    """Run retrieval_metrics at each k in `ks` and return a before/after table.
-
-    This is the tuning iteration itself, in code: two eval runs plus a diff,
-    not just numbers copied into README by hand. `python eval.py compare 3 5`
-    reruns this against the live store and prints the same table.
-    """
-    runs = [retrieval_metrics(store, test_set, k=k) for k in ks]
-
-    # per-question rank at each k, so a "before" miss that "after" fixes is
-    # visible, not just the aggregate hit_rate/mrr moving
-    rows = [
-        {"question": case.question, "ranks": [run["ranks"][i][1] for run in runs]}
-        for i, case in enumerate(test_set)
-    ]
-
-    return {"ks": ks, "runs": runs, "rows": rows}
-
-
-def print_comparison(comparison: dict) -> None:
-    ks = comparison["ks"]
-    runs = comparison["runs"]
-    header = "".join(f"{'k=' + str(k):>12}" for k in ks)
+def print_comparison(comparison: ComparisonReport) -> None:
+    header = "".join(f"{'k=' + str(k):>12}" for k in comparison.ks)
     print(f"{'':30}{header}")
-    print(f"{'Hit Rate':30}" + "".join(f"{r['hit_rate']:>12.3f}" for r in runs))
-    print(f"{'MRR':30}" + "".join(f"{r['mrr']:>12.3f}" for r in runs))
+    print(f"{'Hit Rate':30}" + "".join(f"{r.hit_rate:>12.3f}" for r in comparison.runs))
+    print(f"{'MRR':30}" + "".join(f"{r.mrr:>12.3f}" for r in comparison.runs))
 
-    changed = [row for row in comparison["rows"] if len(set(row["ranks"])) > 1]
+    changed = [row for row in comparison.rows if len(set(row["ranks"])) > 1]
     if changed:
         print(f"\n{len(changed)} question(s) whose rank changed:")
         for row in changed:
@@ -258,23 +248,8 @@ def print_comparison(comparison: dict) -> None:
             print(f"  {rank_str:20} {row['question']}")
 
 
-def print_report(retrieval: dict, generation: dict | None = None) -> None:
-    print(f"Hit Rate@{retrieval['k']}: {retrieval['hit_rate']:.3f}")
-    print(f"MRR@{retrieval['k']}:      {retrieval['mrr']:.3f}")
-    misses = [(case, rank) for case, rank in retrieval["ranks"] if rank is None or rank > 1]
-    if misses:
-        print(f"\n{len(misses)} question(s) not a rank-1 hit:")
-        for case, rank in misses:
-            print(f"  rank={rank!s:>4}  {case.question}")
-    if generation:
-        print(f"\navg faithfulness:       {generation['avg_faithfulness']:.3f}")
-        print(f"avg answer_relevancy:   {generation['avg_answer_relevancy']:.3f}")
-        print(f"avg context_precision:  {generation['avg_context_precision']:.3f}")
-
-
 def _self_check():
     class FakeStore:
-        # question -> pages, in retrieved order, deterministic for the test
         _pages = {
             "hit at rank 1": [1, 2, 3],
             "hit at rank 3": [9, 9, 1],
@@ -292,19 +267,21 @@ def _self_check():
         TestCase("hit at rank 3", "", (1,)),
         TestCase("miss", "", (1,)),
     ]
-    m = retrieval_metrics(FakeStore(), cases, k=3)
-    assert m["hit_rate"] == 2 / 3, m
-    assert abs(m["mrr"] - (1 / 1 + 1 / 3 + 0) / 3) < 1e-9, m
+    evaluator = RetrievalEvaluator(FakeStore(), cases)
 
-    m_k1 = retrieval_metrics(FakeStore(), cases, k=1)
-    assert m_k1["hit_rate"] == 1 / 3, m_k1  # only the rank-1 hit survives a smaller k
+    report = evaluator.evaluate(k=3)
+    assert report.hit_rate == 2 / 3, report
+    assert abs(report.mrr - (1 / 1 + 1 / 3 + 0) / 3) < 1e-9, report
 
-    comparison = compare_k(FakeStore(), cases, ks=(1, 3))
-    assert comparison["runs"][0]["hit_rate"] == 1 / 3  # k=1
-    assert comparison["runs"][1]["hit_rate"] == 2 / 3  # k=3
-    changed = [row for row in comparison["rows"] if len(set(row["ranks"])) > 1]
+    report_k1 = evaluator.evaluate(k=1)
+    assert report_k1.hit_rate == 1 / 3, report_k1  # only the rank-1 hit survives
+
+    comparison = evaluator.compare(ks=(1, 3))
+    assert comparison.runs[0].hit_rate == 1 / 3
+    assert comparison.runs[1].hit_rate == 2 / 3
+    changed = [row for row in comparison.rows if len(set(row["ranks"])) > 1]
     assert [row["question"] for row in changed] == ["hit at rank 3"]
-    assert changed[0]["ranks"] == [None, 3]  # miss at k=1, rank 3 at k=3
+    assert changed[0]["ranks"] == [None, 3]
 
     print("ok (unit checks only; run eval.py for a live report)")
 
@@ -315,19 +292,21 @@ if __name__ == "__main__":
     warnings.filterwarnings("ignore")
 
     if len(sys.argv) > 1 and sys.argv[1] == "live":
-        from vectorstore import load_vectorstore
+        from chain import RagChain
+        from vectorstore import VectorStoreService
 
         k = int(sys.argv[2]) if len(sys.argv) > 2 else 5
-        store = load_vectorstore()
-        retrieval = retrieval_metrics(store, TEST_SET, k=k)
-        run_generation = "--no-ragas" not in sys.argv
-        generation = generation_metrics(store, TEST_SET, k=k) if run_generation else None
+        store = VectorStoreService().load()
+        retrieval = RetrievalEvaluator(store).evaluate(k=k)
+        generation = None
+        if "--no-ragas" not in sys.argv:
+            generation = GenerationEvaluator(store, RagChain(store)).evaluate(k=k)
         print_report(retrieval, generation)
     elif len(sys.argv) > 1 and sys.argv[1] == "compare":
-        from vectorstore import load_vectorstore
+        from vectorstore import VectorStoreService
 
         ks = tuple(int(x) for x in sys.argv[2:]) or (3, 5)
-        store = load_vectorstore()
-        print_comparison(compare_k(store, TEST_SET, ks=ks))
+        store = VectorStoreService().load()
+        print_comparison(RetrievalEvaluator(store).compare(ks=ks))
     else:
         _self_check()

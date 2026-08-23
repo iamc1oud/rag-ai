@@ -1,14 +1,13 @@
 """Retriever + ChatOllama -> grounded, cited, streamed answers (LCEL).
 
-Threshold pick and the 3 manually-verified test questions: README.md
-("RAG chain" section).
+Threshold pick and the 3 manually-verified test questions: README.md.
 """
 
 from __future__ import annotations
-from langchain_community.vectorstores import VectorStore
 
 from collections.abc import Iterator
 
+from langchain_community.vectorstores import VectorStore
 from langchain_core.documents import Document
 from langchain_core.output_parsers import StrOutputParser
 from langchain_core.prompts import ChatPromptTemplate
@@ -16,18 +15,20 @@ from langchain_ollama import ChatOllama
 
 from config import settings
 
-# Below this cosine similarity, the top retrieved chunk isn't actually about
-# the question -- skip generation rather than let the model improvise on
-# unrelated context. Picked from measured scores on this corpus (README):
-# on-topic questions scored 0.62-0.70, off-topic 0.21-0.35. 0.45 sits in the
-# gap with margin on both sides; it is a property of this embedding model and
-# corpus, not a universal constant. Lives in config.py (settings.SCORE_THRESHOLD)
-# per issue #7; aliased here so existing imports keep working.
-RELEVANCE_THRESHOLD = settings.SCORE_THRESHOLD
 
-NO_CONTEXT_MESSAGE = "I don't know -- no relevant context found for that question."
+class RagChain:
+    """Threshold-gated retrieval + generation over one vector store.
 
-SYSTEM_PROMPT = """You are a RAG assistant. Answer the question using ONLY the \
+    Below RELEVANCE_THRESHOLD, the top retrieved chunk isn't actually about
+    the question -- generation is skipped rather than let the model improvise
+    on unrelated context. 0.45 sits in the measured gap between on-topic
+    (0.62-0.70) and off-topic (0.21-0.35) scores on this corpus (README);
+    it's a property of the embedding model and corpus, not universal.
+    """
+
+    NO_CONTEXT_MESSAGE = "I don't know -- no relevant context found for that question."
+
+    SYSTEM_PROMPT = """You are a RAG assistant. Answer the question using ONLY the \
 numbered context below -- never use outside knowledge, even if you know the answer.
 
 Every context block is labeled with a number, e.g. "[1]". When you use \
@@ -41,79 +42,64 @@ respond with exactly: I don't know -- no relevant context found for that questio
 Context:
 {context}"""
 
+    def __init__(self, store: VectorStore, chat: ChatOllama | None = None,
+                 k: int = settings.K, threshold: float = settings.SCORE_THRESHOLD):
+        self.store = store
+        self.chat = chat or ChatOllama(
+            model=settings.CHAT_MODEL, base_url=settings.OLLAMA_URL, temperature=0
+        )
+        self.k = k
+        self.threshold = threshold
+        prompt = ChatPromptTemplate.from_messages(
+            [("system", self.SYSTEM_PROMPT), ("human", "{question}")]
+        )
+        self._chain = prompt | self.chat | StrOutputParser()
 
-def get_chat() -> ChatOllama:
-    return ChatOllama(model=settings.CHAT_MODEL, base_url=settings.OLLAMA_URL, temperature=0)
+    @staticmethod
+    def format_docs(docs: list[Document]) -> str:
+        """Numbered context blocks the prompt asks the model to cite by number."""
+        return "\n\n".join(
+            f"[{i}] (source: {doc.metadata.get('source')}, page {doc.metadata.get('page')})\n"
+            f"{doc.page_content}"
+            for i, doc in enumerate(docs, start=1)
+        )
 
+    @staticmethod
+    def format_citations(docs: list[Document]) -> str:
+        lines = [
+            f"[{i}] {doc.metadata.get('source')}, page {doc.metadata.get('page')}"
+            for i, doc in enumerate(docs, start=1)
+        ]
+        return "Sources:\n" + "\n".join(lines)
 
-def get_retriever(store, k: int = settings.K):
-    return store.as_retriever(search_kwargs={"k": k})
+    def generate(self, question: str, docs: list[Document]) -> str:
+        """Generate over a caller-chosen set of docs, bypassing the threshold gate."""
+        return self._chain.invoke({"context": self.format_docs(docs), "question": question})
 
+    def answer(self, question: str, k: int | None = None,
+               threshold: float | None = None) -> Iterator[str]:
+        """Retrieve -> threshold-gate -> stream a grounded, cited answer.
 
-def format_docs(docs: list[Document]) -> str:
-    """Numbered context blocks the prompt asks the model to cite by number."""
-    return "\n\n".join(
-        f"[{i}] (source: {doc.metadata.get('source')}, page {doc.metadata.get('page')})\n"
-        f"{doc.page_content}"
-        for i, doc in enumerate(docs, start=1)
-    )
+        Yields NO_CONTEXT_MESSAGE and returns, without calling the chat model,
+        if the top result is below threshold.
+        """
+        k = k if k is not None else self.k
+        threshold = threshold if threshold is not None else self.threshold
 
+        scored = self.store.similarity_search_with_relevance_scores(question, k=k)
+        if not scored or scored[0][1] < threshold:
+            yield self.NO_CONTEXT_MESSAGE
+            return
 
-def format_citations(docs: list[Document]) -> str:
-    """Sources list keyed by the same [n] numbers used in format_docs/the prompt."""
-    lines = [
-        f"[{i}] {doc.metadata.get('source')}, page {doc.metadata.get('page')}"
-        for i, doc in enumerate(docs, start=1)
-    ]
-    return "Sources:\n" + "\n".join(lines)
+        docs = [doc for doc, _score in scored]
+        context = self.format_docs(docs)
+        for token in self._chain.stream({"context": context, "question": question}):
+            yield token
+        yield "\n\n" + self.format_citations(docs)
 
-
-def build_chain(chat: ChatOllama | None = None):
-    """retriever-independent LCEL chain: formatted context + question -> answer.
-
-    Retrieval and the relevance threshold are handled by answer_question()
-    below, not inside this chain -- the threshold has to gate whether the LLM
-    is called *at all*, which an LCEL step run after retrieval can't cheaply
-    veto once it's already wired into the same pipeline.
-    """
-    prompt = ChatPromptTemplate.from_messages(
-        [("system", SYSTEM_PROMPT), ("human", "{question}")]
-    )
-    return prompt | (chat or get_chat()) | StrOutputParser()
-
-
-def answer_question(
-    store: VectorStore,
-    question: str,
-    k: int = settings.K,
-    threshold: float = RELEVANCE_THRESHOLD,
-    chat: ChatOllama | None = None,
-) -> Iterator[str]:
-    """Retrieve -> threshold-gate -> stream a grounded, cited answer.
-
-    Yields the answer text in chunks (chain.stream), then one final chunk
-    with the citation list. Yields NO_CONTEXT_MESSAGE and returns, without
-    calling the chat model, if the top result is below `threshold` -- avoids
-    generating a fabricated answer over irrelevant context.
-    """
-    scored = store.similarity_search_with_relevance_scores(question, k=k)
-    if not scored or scored[0][1] < threshold:
-        yield NO_CONTEXT_MESSAGE
-        return
-
-    docs = [doc for doc, _score in scored]
-    chain = build_chain(chat)
-    context = format_docs(docs)
-
-    for token in chain.stream({"context": context, "question": question}):
-        yield token
-
-    yield "\n\n" + format_citations(docs)
-
-
-def ask(store, question: str, **kwargs) -> str:
-    """Non-streaming convenience wrapper: collect answer_question() into one string."""
-    return "".join(answer_question(store, question, **kwargs))
+    def ask(self, question: str, **kwargs) -> str:
+        """Non-streaming convenience wrapper: collect answer() into one string."""
+        return "".join(self.answer(question, **kwargs))
 
 
 def _self_check():
@@ -125,20 +111,20 @@ def _self_check():
         Document(page_content="CPython is the reference implementation.",
                  metadata={"source": "book.pdf", "page": 6}),
     ]
-    context = format_docs(docs)
+    context = RagChain.format_docs(docs)
     assert "[1] (source: book.pdf, page 5)" in context
     assert "[2] (source: book.pdf, page 6)" in context
     assert "Python was first released in 1991." in context
 
-    citations = format_citations(docs)
+    citations = RagChain.format_citations(docs)
     assert citations == "Sources:\n[1] book.pdf, page 5\n[2] book.pdf, page 6"
 
     class FakeStore:
         def similarity_search_with_relevance_scores(self, question, k):
-            return [(docs[0], 0.1)]  # below RELEVANCE_THRESHOLD
+            return [(docs[0], 0.1)]  # below threshold
 
-    out = ask(FakeStore(), "irrelevant question")
-    assert out == NO_CONTEXT_MESSAGE, out
+    out = RagChain(FakeStore()).ask("irrelevant question")
+    assert out == RagChain.NO_CONTEXT_MESSAGE, out
 
     print("ok (wiring checks only; run chain.py <question> for a live answer)")
 
@@ -150,11 +136,11 @@ if __name__ == "__main__":
     warnings.filterwarnings("ignore")
 
     if len(sys.argv) > 1:
-        from vectorstore import load_vectorstore
+        from vectorstore import VectorStoreService
 
         question = " ".join(sys.argv[1:])
-        store = load_vectorstore()
-        for chunk in answer_question(store, question):
+        store = VectorStoreService().load()
+        for chunk in RagChain(store).answer(question):
             print(chunk, end="", flush=True)
         print()
     else:
