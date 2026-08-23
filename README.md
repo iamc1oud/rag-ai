@@ -304,3 +304,103 @@ once during indexing and once for this check — Ollama's embedding call isn't b
 deterministic across requests), not a metric mismatch. Ranking was identical before and
 after the fix — squared L2 and cosine distance are monotonic transforms of each other
 for unit vectors — but the *reported number* only means "cosine similarity" now.
+
+# RAG chain
+
+`chain.py`. LCEL pipeline wiring the Chroma retriever from issue #4 to `ChatOllama`:
+retrieve -> relevance-threshold gate -> format numbered context -> prompt -> stream ->
+append citations.
+
+```bash
+python chain.py                                          # wiring self-checks
+python chain.py "How do I plot a sine function in matplotlib?"   # live, streamed
+```
+
+## How it's wired
+
+```python
+scored = store.similarity_search_with_relevance_scores(question, k=5)
+if not scored or scored[0][1] < RELEVANCE_THRESHOLD:
+    yield NO_CONTEXT_MESSAGE
+    return                                    # no LLM call at all
+
+chain = prompt | ChatOllama(...) | StrOutputParser()
+for token in chain.stream({"context": format_docs(docs), "question": question}):
+    yield token
+yield format_citations(docs)
+```
+
+The threshold check runs *before* the LCEL chain, not as a step inside it: it has to be
+able to veto generation entirely, and by the time a `RunnableLambda` inside a chain
+sees the retrieved docs, the chain is already committed to calling the model. Keeping
+it as a plain Python `if` ahead of `chain.stream(...)` is also the only way to make the
+"no LLM call for out-of-scope questions" behavior fast and certain rather than a prompt
+instruction the model could ignore.
+
+The prompt instructs the model to answer only from the numbered context, cite the
+block number inline after every sentence that uses it, and reply with the exact string
+`I don't know -- no relevant context found for that question.` when the context doesn't
+cover the question — a second, model-level guardrail behind the retrieval-score one
+(see "A second guardrail" below).
+
+## Picking the relevance threshold
+
+`similarity_search_with_relevance_scores` returns Chroma's cosine similarity (see
+issue #4 — `hnsw:space="cosine"` makes `1 - distance` a real cosine similarity, not an
+arbitrary score). Measured on this corpus, top-1 score for 4 on-topic and 4
+clearly-off-topic questions:
+
+| Question | Top score |
+| --- | --- |
+| How do I plot a sine function with matplotlib? | 0.682 |
+| What is a Python dictionary? | 0.623 |
+| How do I install Python on Windows? | 0.683 |
+| What is the difference between a compiled and interpreted language? | 0.698 |
+| What is the capital of France? | 0.208 |
+| How do I bake a chocolate cake? | 0.323 |
+| What is the Transformer architecture in deep learning? | 0.346 |
+| Who won the world cup in 2018? | 0.271 |
+
+On-topic clusters at 0.62-0.70, off-topic at 0.21-0.35 — a clean gap. `0.45` sits in the
+middle with margin on both sides. This is a property of `nomic-embed-text-v2-moe` and
+this specific corpus (a Python textbook), not a universal constant — a corpus covering
+broader or more overlapping topics would need this re-measured, not assumed.
+
+## Manually verified: 3 grounded questions, citations checked against the source PDF
+
+**"How do I plot a sine function with matplotlib?"** (top score 0.682) — answer cited
+`[1]` (page 50) and `[4]` (page 51). Page 50 contains `Example 4.6.2. Plotting a Sine
+Curve`; page 51 contains the exact `x = np.arange(xstart, xstop, increment)` /
+`grid()` lines the answer describes. Correct.
+
+**"What is the difference between a compiled and interpreted language?"** (top score
+0.698) — cited `[1]`/`[3]` (page 23) and `[2]` (page 22). Page 22 literally reads "code
+you enter is reduced to a set of machine-specific instructions before being saved as an
+executable file" — matches the `[2]` claim word for word. Page 23 has the "must be
+parsed, interpreted, and executed each time" and "ad hoc calculations" language cited
+under `[1]`/`[3]`. Correct. (The chain also retrieved page 103, an unrelated VS Code
+setup page that happens to contain the word "interpreted" — the model correctly never
+cited it in the body, even though it's listed in the Sources block as retrieved.)
+
+**"How do I install Python on Windows?"** (top score 0.683) — cited `[1]` (page 29,
+Microsoft Store + Anaconda instructions) and `[2]` (page 28, the python.org link). Both
+check out against the source text. Retrieved-but-uncited pages 33/87 (Command Prompt,
+pip) were correctly left out of the answer body.
+
+**Out-of-scope: "What is the capital of France?"** (top score 0.208, well under 0.45) —
+returned `I don't know -- no relevant context found for that question.` immediately,
+confirmed via timing that no generation call happened (0.7s total vs. 2+ s for the
+grounded answers above, all of which include a full generation).
+
+## A second guardrail: the threshold passing isn't the same as the answer being grounded
+
+**"What is a Python dictionary?"** scored 0.623 — comfortably over threshold, so
+generation went ahead — and the model still answered
+`I don't know -- no relevant context found for that question.` The retrieved chunks
+(the "What is Python?" chapter intro, the preface, the bibliography) all score
+reasonably high because they're dense with the word "Python", but none of them actually
+covers dictionaries; this book's dictionary content, if any, didn't make the top 5 for
+this phrasing. This is exactly the failure mode a pure similarity-threshold check can't
+catch — high lexical/topical overlap with genuinely wrong content — and it's why the
+prompt also instructs the model to decline when *its* context is insufficient, not just
+the retriever. Two independent checks, two different failure modes covered.
