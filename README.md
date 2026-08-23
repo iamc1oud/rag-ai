@@ -183,3 +183,124 @@ model-specific tokenizer just to size chunks.
   non-English text, heavy LaTeX) — the comparison above is the concrete case for
   needing it, but it isn't the default because it costs a tokenizer dependency and
   a slower splitting pass for a difference that doesn't show up on prose-heavy PDFs.
+
+# Vector store
+
+`vectorstore.py`. Chunks from issue #3 -> embedded via `OllamaEmbeddings` -> stored in
+a persistent `Chroma` collection (`langchain-chroma`).
+
+```bash
+python vectorstore.py                                          # wiring self-checks
+python vectorstore.py "assets/Python Programming.pdf" "python"  # index + query, live
+```
+
+## Which endpoint OllamaEmbeddings calls
+
+`embed_documents()` (used when adding chunks) calls `self._client.embed(...)`, and
+`ollama.Client.embed` POSTs to **`/api/embed`** — confirmed by reading both source
+files (`langchain_ollama/embeddings.py`, `ollama/_client.py`). That's the batch
+endpoint: the whole list of chunk texts goes in one request, one response with an
+`"embeddings"` list back — not the older single-text `/api/embeddings`, which
+`OllamaEmbeddings` never calls. Matters for ingestion throughput: 195 chunks embed in
+one round trip's worth of batching, not 195.
+
+## Chroma vs. FAISS, for this project
+
+| | Chroma (`langchain-chroma`) | FAISS (`langchain-community`) |
+| --- | --- | --- |
+| Persistence | Automatic — give it `persist_directory`, every write lands on disk immediately | In-memory only; `save_local()`/`load_local()` are calls *you* have to remember to make |
+| Runs as | Embedded library, no separate process | Embedded library, no separate process |
+| Metadata filtering | `similarity_search(query, filter={...})`, native | Supported but bolted on (post-filter or a metadata-aware index you configure) |
+| What's stored on disk | Vectors + documents + metadata, one SQLite-backed directory | Just the index; you separately pickle/store the documents and metadata yourself |
+
+Both are embedded (no server), so that's a wash. The deciding factor is persistence
+model: Chroma treats "written = durable" as the default, so `build_vectorstore()` and
+`load_vectorstore()` in this file are ~10 lines total. FAISS makes persistence and
+metadata storage the caller's problem — doable, but it's exactly the kind of manual
+plumbing this project is trying to avoid by using LangChain integrations at all
+(see issue #1). Chosen: Chroma.
+
+Note: current `langchain-chroma`/`chromadb` don't have a `.persist()` method — every
+write already persists as it happens. That method existed in older Chroma releases;
+`Chroma.from_documents(..., persist_directory=...)` is what replaces "create + embed +
+add + persist" as one call now, and `add_documents()` persists on every subsequent add.
+
+## Metadata filtering
+
+Each chunk's metadata (`{"source": ..., "page": ...}`, set in `chunking.to_documents`)
+survives into Chroma untouched, so `similarity_search` can filter by it directly:
+
+```python
+store.similarity_search(query, k=5, filter={"page": 21})
+store.similarity_search(query, k=5, filter={"source": "assets/Python Programming.pdf"})
+```
+
+Verified: filtering by a page from a different, unindexed PDF (`filter={"source":
+"assets/bert-two-column.pdf"}`) returns 0 results even though the index has 195
+chunks — the filter is a real pre-search restriction, not ignored.
+
+## Fresh-process reload + similarity_search(k=5)
+
+```
+$ python -c "from vectorstore import index_pdf; index_pdf('assets/Python Programming.pdf')"
+indexed: 195
+
+# separate python process, no import of index_pdf, only load_vectorstore()
+$ python -c "from vectorstore import load_vectorstore; s = load_vectorstore(); print(s._collection.count())"
+reloaded count: 195
+```
+
+`similarity_search("What is a Python dictionary?", k=5)` after that reload:
+
+```
+page 21  -> "Chapter 2 What is Python? 2.1 Introduction to Python..."
+page 138 -> "[18] python.org, "The python standard library"..."
+page 5   -> "Preface Python is a popular programming language..."
+page 137 -> "Bibliography [1] H.-P. Halvorsen..."
+page 15  -> "We need to find and learn Programming Languages..."
+```
+
+Page 21 (the actual "What is Python?" chapter) ranks first, as expected. The
+bibliography pages ranking 2nd-4th is a real, informative miss: the book's index
+citing `python.org`/`matplotlib.org` lexically overlaps "Python" heavily without being
+about the topic — exactly the kind of result issue #6 (retrieval tuning /
+re-ranking) exists to improve on.
+
+## Sanity-checking a similarity score
+
+Chroma's HNSW index defaults to **squared L2 distance**, not cosine — this was a real
+bug caught while writing this check, not a hypothetical. First pass, without setting
+the distance space:
+
+```
+chroma raw distance:                    0.6365
+hand-computed cosine similarity:        0.6817   ->  1 - cosine = 0.3183
+```
+
+Those don't match — until you notice `0.6365 / 0.3183 ≈ 2`. Confirmed
+`OllamaEmbeddings` output is unit-normalized (`norm(embed_query("test")) ≈ 0.99999986`),
+and for unit vectors `L2² = 2·(1 − cosine_similarity)`. That's exactly the factor of 2
+above: Chroma was returning squared-L2, correctly, just not the metric this check
+expected.
+
+Fix: `build_vectorstore()` now passes `collection_metadata={"hnsw:space": "cosine"}` to
+`Chroma.from_documents`, since the embeddings are meant to be compared by cosine
+similarity. Same query, same top result, after the fix:
+
+```python
+doc, chroma_distance = store.similarity_search_with_score(query, k=1)[0]
+q_vec = embeddings.embed_query(query)
+d_vec = embeddings.embed_query(doc.page_content)
+hand_cosine = sum(a*b for a, b in zip(q_vec, d_vec)) / (norm(q_vec) * norm(d_vec))
+
+# chroma reported distance:              0.318253
+# chroma reported similarity (1 - dist): 0.681747
+# hand-computed cosine similarity:       0.681746
+# difference:                            6.3e-07
+```
+
+The residual `6.3e-07` is re-embedding float noise (the doc text was embedded twice,
+once during indexing and once for this check — Ollama's embedding call isn't bitwise
+deterministic across requests), not a metric mismatch. Ranking was identical before and
+after the fix — squared L2 and cosine distance are monotonic transforms of each other
+for unit vectors — but the *reported number* only means "cosine similarity" now.

@@ -219,3 +219,6 @@ __marimo__/
 
 # Loader debug dumps
 output.json
+
+# Local vector store
+chroma_db/
